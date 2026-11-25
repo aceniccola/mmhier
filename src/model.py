@@ -170,6 +170,13 @@ class RotaryEmbedding(nn.Module):
         self._cache_device = None  # torch.device
 
     @torch._dynamo.disable
+    def compute_cos_sin(self, seq_len: int, *, device, dtype, offset: int = 0):
+        """Uncached get_cos_sin: plain tensor ops, so a compiled graph needs no break."""
+        t = torch.arange(offset, offset + seq_len, device=device, dtype=torch.float32)
+        freqs = torch.outer(t, self.inv_freq.to(device=device))
+        emb = torch.cat([freqs, freqs], dim=-1)
+        return emb.cos().to(dtype=dtype), emb.sin().to(dtype=dtype)
+
     def get_cos_sin(self, seq_len: int, *, device, dtype, offset: int = 0):
         needed = seq_len + offset
         need_new = (
@@ -271,7 +278,8 @@ class MultiheadSelfAttention(nn.Module):
         # RoPE — when using KV cache, offset by the cached sequence length
         if kv_cache is not None:
             rope_offset = kv_cache[0].shape[2]
-        cos, sin = self.rope.get_cos_sin(L, device=x_nld.device, dtype=q.dtype, offset=rope_offset)
+        rope = self.rope.compute_cos_sin if torch.compiler.is_compiling() else self.rope.get_cos_sin
+        cos, sin = rope(L, device=x_nld.device, dtype=q.dtype, offset=rope_offset)
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
 
@@ -297,12 +305,18 @@ class MultiheadSelfAttention(nn.Module):
         q = q * (g.view(1, self.n_heads, 1, 1) * math.sqrt(self.head_dim))
 
         drop = self.dropout_p if self.training else 0.0
-        y = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=attn_mask,
-            dropout_p=drop,
-            is_causal=is_causal,
-        )
+        if L <= 4 and k.shape[2] == L and attn_mask is None and not is_causal and drop == 0.0:
+            # A few keys (RecurrentHierarchy's pair axis, L=2): flash is slow at
+            # this shape; elementwise ops fuse under compile. Same math.
+            w = (q.unsqueeze(-2) * k.unsqueeze(-3)).sum(-1).float() / math.sqrt(self.head_dim)
+            y = (w.softmax(-1).to(v.dtype).unsqueeze(-1) * v.unsqueeze(-3)).sum(-2)
+        else:
+            y = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                dropout_p=drop,
+                is_causal=is_causal,
+            )
         y = y.transpose(1, 2).contiguous().view(N, L, D)
 
         if return_kv_cache:
@@ -372,8 +386,10 @@ class SpaceSelfAttentionModality(nn.Module):
 
 
 class TimeSelfAttention(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, dropout: float, latents_only: bool, n_latents: int):
+    def __init__(self, d_model: int, n_heads: int, dropout: float, latents_only: bool, n_latents: int,
+                 causal: bool = True):
         super().__init__()
+        self.causal = bool(causal)  # False: every block sees every block (RecurrentHierarchy's pair axis)
         self.latents_only = bool(latents_only)
         self.n_latents = int(n_latents)
         self.attn = MultiheadSelfAttention(d_model, n_heads, dropout=dropout)
@@ -403,7 +419,7 @@ class TimeSelfAttention(nn.Module):
                 out = out.view(B, S, T, D).permute(0, 2, 1, 3).contiguous()
                 return out
             else:
-                out = self.attn(x_nld, is_causal=True)
+                out = self.attn(x_nld, is_causal=self.causal)
                 return out.view(B, S, T, D).permute(0, 2, 1, 3).contiguous()
 
 
@@ -420,6 +436,7 @@ class BlockCausalLayer(nn.Module):
         layer_index: int,
         time_every: int,
         latents_only_time: bool,
+        time_causal: bool = True,
     ):
         super().__init__()
         self.do_time = ((layer_index + 1) % time_every == 0)
@@ -430,7 +447,7 @@ class BlockCausalLayer(nn.Module):
 
         if self.do_time:
             self.norm2 = RMSNorm(d_model)
-            self.time = TimeSelfAttention(d_model, n_heads, dropout, latents_only_time, n_latents)
+            self.time = TimeSelfAttention(d_model, n_heads, dropout, latents_only_time, n_latents, causal=time_causal)
             self.drop2 = nn.Dropout(dropout)
 
         self.norm3 = RMSNorm(d_model)
@@ -471,6 +488,7 @@ class BlockCausalTransformer(nn.Module):
         mlp_ratio: float,
         time_every: int,
         latents_only_time: bool,
+        time_causal: bool = True,
     ):
         super().__init__()
         self.layers = nn.ModuleList([
@@ -479,7 +497,7 @@ class BlockCausalTransformer(nn.Module):
                 modality_ids=modality_ids, space_mode=space_mode,
                 dropout=dropout, mlp_ratio=mlp_ratio,
                 layer_index=i, time_every=time_every,
-                latents_only_time=latents_only_time,
+                latents_only_time=latents_only_time, time_causal=time_causal,
             )
             for i in range(depth)
         ])
@@ -882,6 +900,148 @@ class PolicyHeadMTP(nn.Module):
         return torch.tanh(means)
 
 
+class RecurrentHierarchy(nn.Module):
+    """A stack of recurrent levels under a per-frame denoising head (replaces the
+    block-causal transformer when --arch recurrent).
+
+    Level n carries a state S_n (B,S,D). Each frame t, bottom to top, unit n reads
+    the 2-block input (S_n^{t-1}, λ_{n-1}^t) (λ_0 = the frame's tokens x_t) and
+    writes (S_n^t, λ_n^t): the next state (RMS-normalized) and the upward signal.
+    Every unit layer runs space attention within each block and attention across
+    the two blocks at the same slot, so slot i of the state meets slot i of its
+    input. Time is only the recurrence: cost per frame is constant.
+
+    The head is the per-frame denoiser: it reads (x_t, S_N^{t-1}), the frame and
+    the top state from before the frame, with cross-block attention every other
+    layer. Its agent slots are replaced by λ_N^t, so the reward / BC heads read
+    the top level. Flow and BC gradients reach every level top-down (through the
+    head and λ_N) and back in time (through the carried states).
+
+    Local loss (aux_loss, (B,T-1)): level n predicts its next input λ_{n-1}^{t+1}
+    from S_n^t, MLP(LN(S_n^t + c_{t+1})), c = the next frame's action and shortcut
+    tokens. S_n^t is recomputed by re-running unit n on detached inputs, so this
+    loss trains only unit n and its predictor (no gradient into the level below,
+    which writes the target, and none back in time). The predictors are training
+    only. The trainer weights it by the target frame's signal level.
+
+    kv_cache is the list of per-level states. A prefill (return_kv_cache=True)
+    runs the scan and returns the new states. A denoise step (cache set,
+    return_kv_cache=False, one frame) reads the cached states without writing
+    them, so K noisy passes do not advance the state.
+    """
+
+    def __init__(self, *, d_model: int, n_heads: int, modality_ids: torch.Tensor, n_levels: int,
+                 unit_layers: int, head_layers: int, dropout: float, mlp_ratio: float,
+                 unit_mlp_ratio: Optional[float] = None):
+        super().__init__()
+        assert n_levels >= 1
+        self.d_model, self.n_heads, self.n_levels = int(d_model), int(n_heads), int(n_levels)
+        self.dropout = float(dropout)
+        ids = modality_ids.detach().to(dtype=torch.int32).cpu().clone()
+        self.S = int(ids.numel())
+        # Slots as plain slices: a GPU bool-mask index would force a host sync on every scan step.
+        agent_idx = (ids == int(Modality.AGENT)).nonzero().flatten().tolist()
+        assert not agent_idx or agent_idx == list(range(agent_idx[0], agent_idx[-1] + 1)), "agent slots must be contiguous"
+        self.agent_slice = slice(agent_idx[0], agent_idx[-1] + 1) if agent_idx else None
+        cidx = [i for i, m in enumerate(ids.tolist()) if m in (int(Modality.SHORTCUT_SIGNAL), int(Modality.ACTION))]
+        assert cidx == list(range(cidx[0], cidx[-1] + 1)), "action/shortcut slots must be contiguous"
+        self.cond_slice = slice(cidx[0], cidx[-1] + 1)
+        u_mlp = float(mlp_ratio if unit_mlp_ratio is None else unit_mlp_ratio)
+        self.units = nn.ModuleList([self._stack(ids, int(unit_layers), u_mlp, 1) for _ in range(self.n_levels)])
+        self.head = self._stack(ids, int(head_layers), float(mlp_ratio), 2)
+        self.state_norms = nn.ModuleList([RMSNorm(self.d_model) for _ in range(self.n_levels)])
+        self.aux_pred = nn.ModuleList([MLP(self.d_model, 1.0) for _ in range(self.n_levels)])  # training only
+        self.aux_loss: Optional[torch.Tensor] = None
+        self.aux_levels: Optional[torch.Tensor] = None
+        # What the scan calls: the stacks, or compiled wrappers (compile_stacks). A dict,
+        # so the wrappers are not registered as submodules and the state dict keeps its keys.
+        self._run = {"units": list(self.units), "head": self.head, "scan": self._scan_step}
+
+    def _stack(self, ids: torch.Tensor, depth: int, mlp_ratio: float, time_every: int) -> BlockCausalTransformer:
+        # The "time" axis holds the stacked input blocks (non-causal); real time is the recurrence.
+        return BlockCausalTransformer(
+            d_model=self.d_model, n_heads=self.n_heads, depth=depth, n_latents=0, modality_ids=ids,
+            space_mode="wm_agent", dropout=self.dropout, mlp_ratio=mlp_ratio, time_every=time_every,
+            latents_only_time=False, time_causal=False,
+        )
+
+    def compile_stacks(self) -> None:
+        """torch.compile the units, the head and one scan step (same math; the scan is launch-bound)."""
+        cfg = torch._dynamo.config
+        for name in ("recompile_limit", "cache_size_limit"):  # new name, old alias
+            if hasattr(cfg, name):
+                setattr(cfg, name, max(getattr(cfg, name), 64))
+        self._run = {"units": [torch.compile(u) for u in self.units], "head": torch.compile(self.head)}
+        # ponytail: no CUDA graphs. mode="reduce-overhead" on the scan step stalls in training (torch 2.8): T graph
+        # calls per forward before one backward miss cudagraph trees' fast path ("pending, uninvoked backwards").
+        # Upgrade path: capture the whole train step as one graph.
+        self._run["scan"] = torch.compile(self._scan_step)
+
+    def _unit(self, i: int, s_in: torch.Tensor, lam_in: torch.Tensor):
+        """Unit i on (S^{t-1}, λ^t) for a batch of frames: (S^t, λ_i^t)."""
+        y = self._run["units"][i](torch.stack([s_in, lam_in], dim=1))
+        return self.state_norms[i](y[:, 0]), y[:, 1]
+
+    def _scan_step(self, states: List[torch.Tensor], lam: torch.Tensor):
+        new_s, lams = [], []
+        for i in range(self.n_levels):
+            s, lam = self._unit(i, states[i], lam)
+            new_s.append(s)
+            lams.append(lam)
+        return new_s, lams
+
+    def _head_out(self, tok: torch.Tensor, s_top: torch.Tensor) -> torch.Tensor:
+        return self._run["head"](torch.stack([tok, s_top], dim=1))[:, 0]
+
+    def _mix(self, h: torch.Tensor, lam_top: torch.Tensor) -> torch.Tensor:
+        a = self.agent_slice
+        return h if a is None else torch.cat([h[:, : a.start], lam_top[:, a], h[:, a.stop :]], dim=1)
+
+    def _aux_local(self, x: torch.Tensor, ss: List, lams: List, init: List[torch.Tensor]) -> None:
+        # All T-1 steps of a level in one batched call: the (detached) inputs are known once the scan has run.
+        B, T, S, D = x.shape
+        c = x[:, 1:, self.cond_slice].detach().sum(2, keepdim=True)  # frame t+1's action + shortcut tokens
+        errs = []
+        for n in range(self.n_levels):
+            below = x if n == 0 else torch.stack([l[n - 1] for l in lams], 1)  # λ_{n-1}^t, all t
+            s_in = torch.stack([init[n]] + [ss[t][n] for t in range(T - 2)], 1)  # S_n^{t-1}, t < T-1
+            s, _ = self._unit(n, s_in.detach().flatten(0, 1), below[:, :-1].detach().flatten(0, 1))
+            pred = self.aux_pred[n](F.layer_norm(s.view(B, T - 1, S, D) + c, (D,)))
+            tgt = F.layer_norm(below[:, 1:].float(), (D,)).detach()
+            errs.append((F.layer_norm(pred.float(), (D,)) - tgt).pow(2).mean(dim=(2, 3)))  # (B,T-1)
+        per = torch.stack(errs)  # (N,B,T-1)
+        self.aux_levels = per.mean(dim=(1, 2)).detach()  # per-level error, for logging
+        self.aux_loss = per.mean(0)
+
+    def forward(self, x: torch.Tensor, kv_cache: Optional[List[torch.Tensor]] = None,
+                return_kv_cache: bool = False):
+        B, T, S, _ = x.shape
+        assert S == self.S
+        self.aux_loss = self.aux_levels = None
+        if kv_cache is not None and not return_kv_cache:  # denoise step: the carried states stay put
+            assert T == 1, "denoise step takes one frame"
+            h = self._head_out(x[:, 0], kv_cache[-1])
+            if self.agent_slice is not None:  # the BC / reward heads read λ_N of this frame
+                h = self._mix(h, self._scan_step(kv_cache, x[:, 0])[1][-1])
+            return h.unsqueeze(1)
+        states = list(kv_cache) if kv_cache is not None else [x.new_zeros(B, S, self.d_model)] * self.n_levels
+        init = states
+        ss, lams, prev = [], [], []
+        for t in range(T):  # only the (small) units recur
+            prev.append(states[-1])  # what frame t's head reads
+            states, lam = self._run["scan"](states, x[:, t])
+            ss.append(states)
+            lams.append(lam)
+        # The head reads only states the scan already wrote, so it runs once on all frames.
+        lam_top = torch.stack([l[-1] for l in lams], 1).flatten(0, 1)
+        y = self._mix(self._head_out(x.flatten(0, 1), torch.stack(prev, 1).flatten(0, 1)), lam_top).view(B, T, S, -1)
+        if T > 1 and torch.is_grad_enabled():
+            self._aux_local(x, ss, lams, init)
+        if return_kv_cache:
+            return y, states
+        return y
+
+
 class Dynamics(nn.Module):
     def __init__(
         self,
@@ -899,8 +1059,14 @@ class Dynamics(nn.Module):
         mlp_ratio: float = 4.0,
         time_every: int = 4,
         lang_dim: int = 0,
+        arch: str = "transformer",
+        n_levels: int = 4,
+        unit_layers: int = 1,
+        head_layers: int = 10,
+        unit_mlp_ratio: Optional[float] = None,
     ):
         super().__init__()
+        self.arch = str(arch)
         assert d_spatial % d_bottleneck == 0, "expected packing: d_spatial = d_bottleneck * packing_factor"
         self.d_model = int(d_model)
         self.d_spatial = int(d_spatial)
@@ -948,18 +1114,27 @@ class Dynamics(nn.Module):
         self.agent_slice = sl.get(Modality.AGENT, slice(0, 0))
         modality_ids = self.layout.modality_ids()
 
-        self.transformer = BlockCausalTransformer(
-            d_model=self.d_model,
-            n_heads=int(n_heads),
-            depth=int(depth),
-            n_latents=0,
-            modality_ids=modality_ids,
-            space_mode="wm_agent",
-            dropout=float(dropout),
-            mlp_ratio=float(mlp_ratio),
-            time_every=int(time_every),
-            latents_only_time=False,
-        )
+        if self.arch == "recurrent":
+            self.transformer = RecurrentHierarchy(
+                d_model=self.d_model, n_heads=int(n_heads), modality_ids=modality_ids, n_levels=int(n_levels),
+                unit_layers=int(unit_layers), head_layers=int(head_layers), dropout=float(dropout),
+                mlp_ratio=float(mlp_ratio), unit_mlp_ratio=unit_mlp_ratio,
+            )
+        elif self.arch == "transformer":
+            self.transformer = BlockCausalTransformer(
+                d_model=self.d_model,
+                n_heads=int(n_heads),
+                depth=int(depth),
+                n_latents=0,
+                modality_ids=modality_ids,
+                space_mode="wm_agent",
+                dropout=float(dropout),
+                mlp_ratio=float(mlp_ratio),
+                time_every=int(time_every),
+                latents_only_time=False,
+            )
+        else:
+            raise ValueError(f"arch must be transformer|recurrent, got {self.arch}")
 
         self.flow_x_head = nn.Linear(self.d_model, self.d_spatial)
         nn.init.zeros_(self.flow_x_head.weight)
@@ -1011,7 +1186,9 @@ class Dynamics(nn.Module):
         tokens = torch.cat(toks, dim=2)  # (B,T,S,D)
 
         if return_kv_cache:
-            x, new_cache = self.transformer(tokens, return_kv_cache=True)
+            # kv_cache is forwarded so a recurrent prefill continues the carried states
+            # (the attention stack ignores it and prefills from the given tokens).
+            x, new_cache = self.transformer(tokens, kv_cache=kv_cache, return_kv_cache=True)
         elif kv_cache is not None:
             x = self.transformer(tokens, kv_cache=kv_cache)
         else:
@@ -1024,6 +1201,8 @@ class Dynamics(nn.Module):
         if self.n_agent > 0:
             h_t = x[:, :, self.agent_slice, :]   # (B,T,n_agent,d_model)
 
+        self.aux_loss = getattr(self.transformer, "aux_loss", None)  # recurrent: local loss (B,T-1)
+        self.aux_levels = getattr(self.transformer, "aux_levels", None)
         if return_kv_cache:
             return x1_hat, h_t, new_cache
         return x1_hat, h_t

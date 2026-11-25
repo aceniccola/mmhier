@@ -548,6 +548,11 @@ def load_dynamics_from_ckpt(
         mlp_ratio=mlp_ratio,
         time_every=time_every,
         lang_dim=lang_dim,
+        arch=str(a.get("arch", "transformer")),
+        n_levels=int(a.get("n_levels", 4)),
+        unit_layers=int(a.get("unit_layers", 1)),
+        head_layers=int(a.get("head_layers", 10)),
+        unit_mlp_ratio=a.get("unit_mlp_ratio"),
     ).to(device)
     dyn.load_state_dict(_get_state_dict(ckpt), strict=True)
     dyn.eval()

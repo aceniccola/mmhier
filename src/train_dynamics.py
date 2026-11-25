@@ -282,6 +282,9 @@ def dynamics_pretrain_loss(
     rms_flow: Optional[EmaRms] = None,
     rms_rew: Optional[EmaRms] = None,
     rms_bc: Optional[EmaRms] = None,
+    bc_detach: bool = True,
+    pred_weight: float = 0.0,
+    rms_pred: Optional[EmaRms] = None,
 ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     device = z1.device
     B, T = z1.shape[:2]
@@ -320,8 +323,16 @@ def dynamics_pretrain_loss(
 
     lang_emb_self = lang_emb[B_emp:] if lang_emb is not None else None
 
-    # Main forward
+    # Main forward. Capture the recurrent local loss now: the bootstrap forwards below overwrite it.
     z1_hat_full, h_t_full = dynamics(actions, step_idx_full, sigma_idx_full, z_tilde_full, act_mask=act_mask_full, agent_tokens=None, lang_emb=lang_emb)
+    pred_loss = getattr(dynamics, "aux_loss", None)  # (B,T-1): the error for target frame t+1
+    pred_levels = getattr(dynamics, "aux_levels", None)
+    if pred_loss is None:
+        pred_loss = torch.zeros((), device=device)
+        pred_levels = torch.zeros((0,), device=device)
+    else:  # weight by the target frame's signal level: its noise is the part no past can predict
+        w_tgt = sigma_full[:, 1:].float()
+        pred_loss = (pred_loss * w_tgt).sum() / w_tgt.sum().clamp_min(1e-6)
     z1_hat_emp = z1_hat_full[:B_emp]
     z1_hat_self = z1_hat_full[B_emp:]
 
@@ -448,8 +459,9 @@ def dynamics_pretrain_loss(
         # Combined per-element mask: valid timestep AND valid dim for this task.
         full_mask = pos_mask_btl.unsqueeze(-1).to(dim_mask_btla.dtype) * dim_mask_btla  # (B, T, L, A)
 
-        # Policy forward with gradient isolation.
-        pred_btla = policy_head(h_t_full.detach())                          # (B, T, L, A)
+        # bc_detach keeps BC off the world model (mmbench2); --no-bc_detach lets the action
+        # loss into it as a second top-down signal (Dreamer 4 phase 2; the hierarchy recipe).
+        pred_btla = policy_head(h_t_full.detach() if bc_detach else h_t_full)  # (B, T, L, A)
 
         diff_sq = (pred_btla.float() - tgt_btla.float()).pow(2)
         masked_sq = diff_sq * full_mask.float()
@@ -474,10 +486,17 @@ def dynamics_pretrain_loss(
     else:
         loss_bc_normed = loss_bc
 
+    if rms_pred is not None and pred_weight > 0.0 and pred_levels.numel() > 0:
+        rms_pred.update(pred_loss.detach())
+        loss_pred_normed = rms_pred.normalize(pred_loss)
+    else:
+        loss_pred_normed = pred_loss
+
     loss = (
         loss_flow_normed
         + float(reward_weight) * loss_rew_normed
         + float(bc_weight) * loss_bc_normed
+        + float(pred_weight) * loss_pred_normed
     )
 
     aux = {
@@ -494,6 +513,9 @@ def dynamics_pretrain_loss(
         "rms_flow": rms_flow.rms_val if rms_flow is not None else 1.0,
         "rms_rew": rms_rew.rms_val if rms_rew is not None else 1.0,
         "rms_bc": rms_bc.rms_val if rms_bc is not None else 1.0,
+        "loss_pred": pred_loss.detach(),
+        "pred_levels": pred_levels.detach().float(),  # (n_levels,) per-level local error; empty for the transformer
+        "rms_pred": rms_pred.rms_val if rms_pred is not None else 1.0,
     }
     return loss, aux
 
@@ -1278,7 +1300,14 @@ def train(args):
         mlp_ratio=args.mlp_ratio,
         time_every=args.time_every,
         lang_dim=args.lang_dim,
+        arch=args.arch,
+        n_levels=args.n_levels,
+        unit_layers=args.unit_layers,
+        head_layers=args.head_layers,
+        unit_mlp_ratio=args.unit_mlp_ratio,
     ).to(device)
+    if args.arch == "recurrent" and args.compile_hier:
+        dyn.transformer.compile_stacks()
 
     # -----------------------
     # Reward head (optional)
@@ -1323,6 +1352,7 @@ def train(args):
     rms_flow = EmaRms().to(device)
     rms_rew  = EmaRms().to(device)
     rms_bc   = EmaRms().to(device)
+    rms_pred = EmaRms().to(device)
 
     if is_rank0():
         print(dyn)
@@ -1334,7 +1364,8 @@ def train(args):
             print(f"Learnable parameters (dynamics): {dyn_param_count:,}")
             print(f"Learnable parameters (reward head): {rew_param_count:,}")
         if policy_head is not None:
-            print(f"Learnable parameters (policy/BC head, gradient-isolated): {bc_param_count:,}")
+            iso = "gradient-isolated" if args.bc_detach else "BC also trains the dynamics"
+            print(f"Learnable parameters (policy/BC head, {iso}): {bc_param_count:,}")
         print(f"Total learnable parameters: {param_count:,}")
         print(f"[tokenizer] H={H} W={W} C={C} patch={patch} n_lat={n_latents} d_b={d_bottleneck} packing={args.packing_factor}")
 
@@ -1412,7 +1443,7 @@ def train(args):
     ckpt_dir = Path(args.ckpt_dir)
     if args.resume is not None:
         step, start_epoch = load_ckpt(Path(args.resume), dyn_model=dyn, rew_head=rew_head, policy_head=policy_head, opt=opt,
-                                      rms_objects={"flow": rms_flow, "rew": rms_rew, "bc": rms_bc},
+                                      rms_objects={"flow": rms_flow, "rew": rms_rew, "bc": rms_bc, "pred": rms_pred},
                                       strict=args.resume_strict)
         if is_rank0():
             print(f"[rank0] Resumed from {args.resume} (step={step}, epoch={start_epoch})")
@@ -1480,12 +1511,16 @@ def train(args):
                             rms_flow=rms_flow,
                             rms_rew=rms_rew,
                             rms_bc=rms_bc,
+                            bc_detach=args.bc_detach,
+                            pred_weight=args.pred_weight,
+                            rms_pred=rms_pred,
                         )
 
                     if ddp:
                         rms_flow.sync(world_size)
                         rms_rew.sync(world_size)
                         rms_bc.sync(world_size)
+                        rms_pred.sync(world_size)
 
                     # Accumulate per-domain flow_mse for the empirical portion
                     # of the batch (first B_emp samples, aligned with flow_per_sample).
@@ -1694,6 +1729,8 @@ def train(args):
                             "loss/loss_self": float(aux["loss_self"].item()),
                             "loss/reward_ce": float(aux["loss_rew"].item()),
                             "loss/bc_mse": float(aux["loss_bc"].item()),
+                            "loss/pred": float(aux["loss_pred"].item()),
+                            **{f"loss/pred_l{i + 1}": v for i, v in enumerate(aux["pred_levels"].tolist())},
                             "stats/action_shuffle_loss_ratio": float(action_shuffle_loss_ratio.item()),
                             "stats/sigma_mean": float(aux["sigma_mean"].item()),
                             "stats/sigma_std": float(aux["sigma_std"].item()),
@@ -1710,6 +1747,7 @@ def train(args):
                             "rms/flow": aux["rms_flow"],
                             "rms/rew": aux["rms_rew"],
                             "rms/bc": aux["rms_bc"],
+                            "rms/pred": aux["rms_pred"],
                         },
                         step=step,
                     )
@@ -1736,7 +1774,7 @@ def train(args):
 
                 # Checkpointing
                 if is_rank0() and args.save_every > 0 and (step % args.save_every == 0) and step > 0 and do_step:
-                    rms_state = {"flow": rms_flow.state_dict(), "rew": rms_rew.state_dict(), "bc": rms_bc.state_dict()}
+                    rms_state = {"flow": rms_flow.state_dict(), "rew": rms_rew.state_dict(), "bc": rms_bc.state_dict(), "pred": rms_pred.state_dict()}
                     ckpt_path = ckpt_dir / f"step_{step:07d}.pt"
                     save_ckpt(ckpt_path, step=step, epoch=epoch, dyn_model=dyn, rew_head=rew_head, policy_head=policy_head, opt=opt, args=args, rms_state=rms_state)
                     latest = ckpt_dir / "latest.pt"
@@ -1850,8 +1888,20 @@ if __name__ == "__main__":
     p.add_argument("--reward_mlp_ratio", type=float, default=2.0)
     p.add_argument("--reward_pool_agent", type=str, default="attn", choices=["attn", "mean", "first"])
 
-    # BC policy head (gradient-isolated from dynamics)
+    # Dynamics backbone: the block-causal transformer, or the recurrent hierarchy (model.RecurrentHierarchy)
+    p.add_argument("--arch", type=str, default="transformer", choices=["transformer", "recurrent"])
+    p.add_argument("--n_levels", type=int, default=4, help="recurrent: number of levels")
+    p.add_argument("--unit_layers", type=int, default=1, help="recurrent: layers per level unit")
+    p.add_argument("--head_layers", type=int, default=10, help="recurrent: layers of the per-frame denoising head")
+    p.add_argument("--unit_mlp_ratio", type=float, default=1.0, help="recurrent: the units' MLP ratio (the head uses --mlp_ratio)")
+    p.add_argument("--compile_hier", action=argparse.BooleanOptionalAction, default=True,
+                   help="recurrent: torch.compile the units, the head and one scan step (speed only)")
+    p.add_argument("--pred_weight", type=float, default=1.0, help="recurrent: weight of the per-level local prediction loss")
+
+    # BC policy head (gradient-isolated from dynamics unless --no-bc_detach)
     p.add_argument("--bc_weight", type=float, default=0)  # set >0 to enable
+    p.add_argument("--bc_detach", action=argparse.BooleanOptionalAction, default=True,
+                   help="--no-bc_detach: the BC loss also trains the dynamics (the hierarchy recipe)")
     p.add_argument("--bc_L", type=int, default=8)
     p.add_argument("--bc_act_dim", type=int, default=16)
     p.add_argument("--bc_mlp_ratio", type=float, default=2.0)
